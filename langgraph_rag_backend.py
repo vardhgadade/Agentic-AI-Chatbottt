@@ -1,0 +1,291 @@
+
+import requests
+from typing import Annotated, TypedDict, Any, Dict, Optional
+from langgraph.graph.message import add_messages #reducer
+from dotenv import load_dotenv
+from langchain_core.tools import tool  
+from langgraph.prebuilt import ToolNode, tools_condition # tool condition is used in edges 
+from langgraph.graph import START, END, StateGraph
+from langchain_groq import ChatGroq
+from langchain_community.document_loaders import PDFPlumberLoader
+from langchain_core.messages import BaseMessage, SystemMessage
+
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
+from langchain_community.tools import WikipediaQueryRun
+from langchain_community.utilities import WikipediaAPIWrapper
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import CrossEncoderReranker#re ranker 
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder # re ranker model 
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+import tempfile
+import os
+from dotenv import load_dotenv
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse
+load_dotenv()
+
+
+model = ChatGroq(model="openai/gpt-oss-120b")
+#model = ChatGroq(model="openai/gpt-oss-20b")
+
+# embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-large-en-v1.5")
+# reranker_model=HuggingFaceCrossEncoder(model_name="BAAI/bge-reranker-base")
+
+# had to change the latge embedding modelbecasue it was causing problem while deploying 
+# one more problem occured while deploying on render (free render problem cannot load this models at once ,lazy load problem)loading this embedding model although changed the bge 1.5 gb model with small model and also the reranker but then also this problem came .writing this for understanding what proble came problem is to make func of model and calling that function whereever we wanna use embedding model
+
+# embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+# reranker_model = HuggingFaceCrossEncoder(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
+embeddings = None
+reranker_model = None
+
+def get_embeddings():
+    global embeddings
+    if embeddings is None:
+        embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+    return embeddings
+
+def get_reranker():
+    global reranker_model
+    if reranker_model is None:
+        reranker_model = HuggingFaceCrossEncoder(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
+    return reranker_model
+
+
+# key = thread_id, value = FAISS retriever for that thread's PDF
+# this way each chat thread has its own independent PDF — no overwriting
+_THREAD_RETRIEVERS: Dict[str, Any] = {}
+
+# key = thread_id, value = metadata dict (filename, doc count, chunk count)
+# used to show PDF info in the frontend
+_THREAD_METADATA: Dict[str, dict] = {}
+
+
+def _get_retriever(thread_id: Optional[str]):
+    """Fetch the retriever for a thread if available."""
+    if thread_id and thread_id in _THREAD_RETRIEVERS:
+        return _THREAD_RETRIEVERS[thread_id]
+    return None  # returns None if no PDF uploaded for this thread yet
+
+
+def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None) -> dict:
+    
+    if not file_bytes:
+        raise ValueError("No bytes received for ingestion.")
+
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+        temp_file.write(file_bytes)
+        temp_path = temp_file.name
+
+        
+
+    try:
+        loader = PDFPlumberLoader(temp_path)
+        docs = loader.load()
+    
+
+
+
+       
+        
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
+        )
+        chunks = splitter.split_documents(docs)
+        
+        
+        
+
+        
+        vector_store = Chroma.from_documents(chunks,get_embeddings(),
+                    persist_directory=f"./chroma_db/{thread_id}"
+                )
+         
+        
+        
+        
+
+        similarity_retriever= vector_store.as_retriever(search_type='similarity',search_kwargs={'k':10})
+
+        #bm25 keyword search
+        bm25_retriver=BM25Retriever.from_documents(chunks)
+    
+        bm25_retriver.k = 10
+        
+        #hybrid retriever
+        retriever=EnsembleRetriever(retrievers=[bm25_retriver,similarity_retriever], weights=[0.5,0.5])
+
+        #reranker
+        compressor=CrossEncoderReranker(model=get_reranker(),top_n=4)
+        retriever=ContextualCompressionRetriever(base_retriever=retriever,base_compressor=compressor)
+
+
+    
+
+
+
+        # store retriever and metadata mapped to this thread_id
+        # each thread gets its own retriever — completely isolated
+        _THREAD_RETRIEVERS[str(thread_id)] = retriever
+        _THREAD_METADATA[str(thread_id)] = {
+            "filename": filename or os.path.basename(temp_path),
+            "documents": len(docs),
+            "chunks": len(chunks),
+        }
+
+        return {
+            "filename": filename or os.path.basename(temp_path),
+            "documents": len(docs),
+            "chunks": len(chunks),
+        }
+    finally:
+        
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+
+
+
+
+search_tool = TavilySearchResults(max_results=5)
+
+wiki_tool=WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper())
+
+@tool
+def get_stock_price(symbol: str) -> dict:
+    """fetch the latest stock price for a given symbol (e.g. 'AAPL', 'TSLA') using Alpha Vantage."""
+    api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
+    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={api_key}"
+    r = requests.get(url)
+    return r.json()
+
+@tool
+def read_webpage(url: str) -> str:
+    """Read the text of one specific web page from its URL so it can be summarized or questioned.
+    Use when the user shares a link (article, blog post, documentation, GitHub page)."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or parsed.hostname in (None, "localhost", "127.0.0.1", "0.0.0.0"):
+        return "Error: only public http/https links are allowed."
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+        text = " ".join(soup.get_text(separator=" ").split())
+        return text[:5000] if text else "Error: no readable text found on that page."
+    except Exception as e:
+        return f"Error: could not read page ({e})"
+
+
+# thread_id is passed so we fetch the correct retriever for this specific chat thread
+# this is better than a global vectorstore — each thread has its own PDF
+@tool
+def rag_tool(query: str, thread_id: Optional[str] = None) -> str:
+    """
+    Retrieve relevant information from the uploaded PDF for this chat thread.
+    Always include the thread_id when calling this tool.
+    """
+    retriever = _get_retriever(thread_id)
+    if retriever is None:
+        return "Error: No document indexed for this chat. Upload a PDF first."
+
+    result = retriever.invoke(query)
+    context = [doc.page_content for doc in result]
+    return "\n\n".join(context)
+
+
+tools = [get_stock_price,search_tool, rag_tool,wiki_tool,read_webpage]
+
+model_with_tools = model.bind_tools(tools)
+
+
+
+class chatstate(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages] # same state as chatbot
+
+
+
+def chat_node(state: chatstate, config=None):
+
+    # extract thread_id from config so we can pass it in system message
+    thread_id = None
+    if config and isinstance(config, dict):
+        thread_id = config.get("configurable", {}).get("thread_id")
+
+    
+    system_message = SystemMessage(
+        content=(
+            f"You are a helpful assistant. Thread ID: {thread_id}. "
+            "Rules for tool use:\n"
+            "1. For any question about an uploaded PDF or document, call the rag_tool exactly once with this thread_id.\n"
+            "2. Once rag_tool returns a result, treat it as the ground truth for that document, even if the "
+            "subject (company, product, person, etc.) is unfamiliar to you or sounds unverifiable. Do not call "
+            "any web search or Wikipedia tool to double check or supplement a rag_tool result -- the document is "
+            "the single source of truth for its own contents.\n"
+            "3. Only use a web search or Wikipedia tool when the question is clearly about general or current "
+            "knowledge unrelated to any uploaded document (e.g. news, public figures, general facts).\n"
+            "4. Never call more than one tool for the same question unless the question explicitly requires "
+            "combining information from two different sources.\n"
+            "5. After receiving a tool result, always produce a final answer immediately. Do not call the same "
+            "or a different tool again to re-verify a result you already have.\n"
+            "6. If rag_tool returns any non-empty text, you MUST base your answer strictly on that returned text. "
+            "Do not invent names, numbers, or facts that are not present in it, and do not say you lack the "
+            "document or the information once rag_tool has already returned content -- read it carefully and "
+            "answer directly from it.\n"
+            "7. If rag_tool returns an empty result or an explicit error message, only then say the information "
+            "is not available in the document.\n"
+            "When the user shares a web link, call read_webpage with that URL and answer from the page content.\n"
+            "Give short, clean answers only."
+        )
+    )
+
+    messages = [system_message, *state["messages"]]
+    response = model_with_tools.invoke(messages, config=config) 
+
+    return {'messages': [response]}
+
+
+tool_node = ToolNode(tools) 
+
+graph = StateGraph(chatstate)
+
+graph.add_node('chat_node', chat_node)
+graph.add_node("tools", tool_node)
+
+graph.add_edge(START, 'chat_node')
+graph.add_conditional_edges("chat_node", tools_condition) # from where is the condition and tools condition tell which tool to go for
+graph.add_edge("tools", "chat_node")
+
+checkpointer = SqliteSaver(conn=sqlite3.connect(database="chatbot.db", check_same_thread=False))
+#checkpointer=InMemorySaver()
+chatbot1 = graph.compile(checkpointer=checkpointer)
+
+
+chatbot1
+
+def retrieve_all_threads(): #->  how many thread id is currently in our db
+    all_threads = set() #because we want no of unique if we print like this only no of checkpoints it will print that many time threads for ex we have 4 checkpoint in thread 1 so this will print thread id 4 times that s why using set to print unique thread id  
+    for checkpoint in checkpointer.list(None):
+        all_threads.add(checkpoint.config['configurable']['thread_id']) # in the list we are going in the config and configurable part because that has the thread id and then thread id we extracted the thread id 
+        # in all threads only unique thread id will get added and after it will return the list 
+
+    return list(all_threads)
+
+
+def thread_has_document(thread_id: str) -> bool:
+    # helper for frontend — check if this thread already has a pdf uploaded
+    return str(thread_id) in _THREAD_RETRIEVERS
+
+
+def thread_document_metadata(thread_id: str) -> dict:
+    # helper for frontend get filename, doc count, chunk count for this thread meas fr this partucular thead 
+    return _THREAD_METADATA.get(str(thread_id), {})
